@@ -21,12 +21,13 @@ class BoatController:
         self.vid_processor = VideoProcessing()
 
         plt.ion()
-        self.fig,self.ax = plt.subplots()
-        self.drawn, = self.ax.plot([],[],'ro',markersize=4)
-        self.ax.set_xlabel("X position (m)")
-        self.ax.set_ylabel("Y position (m)")
-        self.ax.set_xlim(-5000.0,5000.0)
-        self.ax.set_ylim(-5000.0,5000.0)
+        self.fig,self.ax = plt.subplots(1,2)
+        self.drawn, = self.ax[0].plot([],[],'ro',markersize=4)
+        self.heatmap = self.ax[1].imshow(np.zeros((720,1280),dtype=np.float64),cmap="plasma_r")
+        self.ax[0].set_xlabel("X position (m)")
+        self.ax[0].set_ylabel("Y position (m)")
+        self.ax[0].set_xlim(-5000.0,5000.0)
+        self.ax[0].set_ylim(-5000.0,5000.0)
         self.fig.canvas.draw()
         
 
@@ -49,10 +50,19 @@ class BoatController:
         ret,pts = self.vid_processor.grab_depth()
         print(f"Original shape: {pts.shape}")
         mask = ~np.isnan(pts).any(axis=2)
+
+        pts_zeroed = pts
+        pts_zeroed[~mask] = 8000.0 # set Nan values to 8m
+        pts_zeroed = pts_zeroed[:,:,2] # get only the Z (depth)
+        print(f"Shape of pts zeroed: {pts_zeroed.shape}")
+        print(f"pts zeroed: {pts_zeroed}")
+        self.heatmap.set_data(pts_zeroed)
+        self.heatmap.set_clim(pts_zeroed.min(), pts_zeroed.max())
+
         pts = pts[mask]
-        #print(f"Grabbed depth: ret: {ret}, pts: {pts}")
+        print(f"Grabbed depth: ret: {ret}, pts: {pts}")
         print(f"Final shape: {pts.shape}")
-        print(f"Max raw dist: {max(np.linalg.norm(pts,axis=1))}")
+        print(f"Min raw dist: {min(np.linalg.norm(pts,axis=1))}")
         print(f"Max x dist: {max(pts[:,0])}")
         print(f"Max y dist: {max(pts[:,1])}")
         print(f"Max z dist: {max(pts[:,2])}")
@@ -87,13 +97,14 @@ class BoatController:
 
         print(f"Angles passed: {angles_passed}")
         print(f"Depths passed: {depths_passed}")
-
-        print(f"Max depth: {max(depths_passed)}")
         
         # Plotting code --- just for visualization
-        x_obs = [depths_passed[i] * np.cos(angles_passed[i] * np.pi / 180) for i in range(len(angles_passed))]
-        y_obs = [depths_passed[i] * np.sin(angles_passed[i] * np.pi / 180) for i in range(len(angles_passed))]
+        # x_obs = [depths_passed[i] * np.cos(angles_passed[i] * np.pi / 180) for i in range(len(angles_passed))]
+        # y_obs = [depths_passed[i] * np.sin(angles_passed[i] * np.pi / 180) for i in range(len(angles_passed))]
+        x_obs = [depths_passed[i] * np.cos(angles_passed[i] * np.pi / 180) for i in range(len(angles_passed)) if depths_passed[i] <= max_supported_dist]
+        y_obs = [depths_passed[i] * np.sin(angles_passed[i] * np.pi / 180) for i in range(len(angles_passed)) if depths_passed[i] <= max_supported_dist]
         #print(f"X obs, Y obs: {x_obs}, {y_obs}")
+        print(f"Min depth: {min([np.sqrt(x_obs[i]**2 + y_obs[i]**2) for i in range(len(x_obs))])}")
         self.drawn.set_xdata(x_obs)
         self.drawn.set_ydata(y_obs)
         self.fig.canvas.draw()

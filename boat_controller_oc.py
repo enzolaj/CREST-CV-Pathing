@@ -4,6 +4,7 @@ import numpy as np
 import cv2
 import time
 import matplotlib.pyplot as plt
+import matplotlib.patches as patches
 from build.depth_wrapper import VideoProcessing 
 
 class BoatController:
@@ -24,8 +25,11 @@ class BoatController:
         self.fig,self.ax = plt.subplots(1,2)
         self.drawn, = self.ax[0].plot([],[],'ro',markersize=4)
         self.heatmap = self.ax[1].imshow(np.zeros((720,1280),dtype=np.float64),cmap="plasma_r")
-        self.ax[0].set_xlabel("X position (m)")
-        self.ax[0].set_ylabel("Y position (m)")
+        circles = []
+        for i in range(4):
+            self.ax[0].add_patch(patches.Circle((0.0, 0.0), radius=1000*(i+1), fill=False, edgecolor='black', linewidth=1))
+        self.ax[0].set_xlabel("X position (mm)")
+        self.ax[0].set_ylabel("Z position (mm)")
         self.ax[0].set_xlim(-5000.0,5000.0)
         self.ax[0].set_ylim(-5000.0,5000.0)
         self.fig.canvas.draw()
@@ -46,18 +50,64 @@ class BoatController:
         # depends on support for extensions to message 330
 
         print("About to grab depth")
+                
+        fov_deg = 110
+        num_pts = 72
+        num_rows = 720
+        num_cols = 1280
+
+        min_supported_dist = 300 # in mm
+        max_supported_dist = 10000 # in mm
+
+        spoof_depth_option = 0
+        row_step = 4                # Row step (Increment to pixels along rows when sampling)
+        col_step = 5                # Col step (Increment to pixels along cols when sampling)
+        processing_flags = 4        # Processing flags
+        patch_size = 7              # Patch size for bilateral filter
+        sigma = 500.0               # Sigma for bilateral filter
         
-        ret,pts = self.vid_processor.grab_depth()
+        t0 = time.perf_counter()
+        if spoof_depth_option == 1:
+            ret = 0
+            pts = np.zeros(shape=(num_rows,num_cols,3))
+            r = np.array(range(num_rows))
+            c = np.array(range(num_cols))
+            C,R = np.meshgrid(c,r)
+            pts[:,:,2] = 2000 + 1*C + 1*R
+            pts[:,:,1] = (R - 360)*5
+            pts[:,:,0] = (C - 640)*5
+        else:
+            ret,pts = self.vid_processor.grab_depth(
+                row_step,
+                col_step,              
+                processing_flags,              
+                patch_size,              
+                sigma           
+            )
+        t1 = time.perf_counter()
+        print(f"Time to grab depth: {t1 - t0}")
         print(f"Original shape: {pts.shape}")
         mask = ~np.isnan(pts).any(axis=2)
 
-        pts_zeroed = pts
+        pts_zeroed = pts.copy()
         pts_zeroed[~mask] = 8000.0 # set Nan values to 8m
         pts_zeroed = pts_zeroed[:,:,2] # get only the Z (depth)
         print(f"Shape of pts zeroed: {pts_zeroed.shape}")
         print(f"pts zeroed: {pts_zeroed}")
+
+        grid_indices = np.indices((num_rows,num_cols))
+        r = np.array(range(num_rows))
+        c = np.array(range(num_cols))
+        C,R = np.meshgrid(c,r)
+        row_cond = (grid_indices[0] % row_step == 0)
+        col_cond = (grid_indices[1] % col_step == 0)
+        cond = row_cond & col_cond
+        pts_zeroed = pts_zeroed[cond].reshape(num_rows // row_step,num_cols // col_step)
+        print(f"Resized points zeroed shape: {pts_zeroed.shape}")
+
         self.heatmap.set_data(pts_zeroed)
-        self.heatmap.set_clim(pts_zeroed.min(), pts_zeroed.max())
+        #self.heatmap.set_clim(pts_zeroed.min(), pts_zeroed.max())
+        self.heatmap.set_clim(min_supported_dist,5000)
 
         pts = pts[mask]
         print(f"Grabbed depth: ret: {ret}, pts: {pts}")
@@ -70,33 +120,44 @@ class BoatController:
         if ret != 0:
             return
         
-        fov_deg = 110
-        num_pts = 72
-
-        min_supported_dist = 10 # in mm
-        max_supported_dist = 10000 # in mm
-        
-        yaws = np.atan2(pts[:,1],-pts[:,0]) * 180 / np.pi
+        yaws = np.atan2(pts[:,0],pts[:,2]) * 180 / np.pi
         print(f"Yaws shape: {yaws.shape}")
+        print(f"Yaw min and max: {max(yaws)}, {min(yaws)}")
 
         angle_offset = float(fov_deg/2) # CW from forward
         increment_f = -1*fov_deg/num_pts
+        bin_width = fov_deg / num_pts
+
         frame = mavutil.mavlink.MAV_FRAME_BODY_FRD
 
         depths_passed = [max_supported_dist+1]*72
         angles_passed = [angle_offset + increment_f*i for i in range(72)]
-        angles_closest = [min(angles_passed, key=lambda x: abs(x - yaw)) for yaw in yaws] # map pts to closest angular slice
-        #print(f"Angles closest: {angles_closest}")
-        depth = np.linalg.norm(pts,axis=1)
-        print(f"depth shape {depth.shape}")
 
-        for idx,angle in enumerate(angles_closest):
-            angle_index = angles_passed.index(angle)
-            if depths_passed[angle_index] is None or depth[idx] < depths_passed[angle_index]:
-                depths_passed[angle_index] = depth[idx]
+        t0 = time.perf_counter()
+        bin_indices = np.floor((angle_offset - yaws) / bin_width).astype(int)
+        bin_indices = np.clip(bin_indices, 0, num_pts-1)
+        print(f"Max, mean, min bin indices {np.max(bin_indices)}, {np.mean(bin_indices)}, {np.min(bin_indices)}")
 
-        print(f"Angles passed: {angles_passed}")
-        print(f"Depths passed: {depths_passed}")
+        target_quantiles = [[] for i in range(72)]
+        depth = np.hypot(pts[:,0], pts[:,2])
+        depths_passed = np.full(num_pts, max_supported_dist+1, dtype=float)
+        for b, d in zip(bin_indices, depth):
+            if d < depths_passed[b]:
+                depths_passed[b] = d
+            target_quantiles[b].append(d)
+
+        tq = time.perf_counter()
+        target_quantiles = [np.array([max_supported_dist+1]) if len(list_) == 0 else np.array(list_) for list_ in target_quantiles]
+        depths_passed = np.full(num_pts, max_supported_dist+1, dtype=float)
+        for i in range(len(depths_passed)):
+            depths_passed[i] = np.quantile(target_quantiles[i],0.01)
+        print(f"Time to do quantiles: {time.perf_counter() - tq}")
+
+        print(f"Time to get angles closest: {time.perf_counter() - t0}")
+        #print(f"depth shape {depth.shape}")
+
+        #print(f"Angles passed: {angles_passed}")
+        print(f"Depths passed has shape {depths_passed.shape} and values: {depths_passed}")
         
         # Plotting code --- just for visualization
         # x_obs = [depths_passed[i] * np.cos(angles_passed[i] * np.pi / 180) for i in range(len(angles_passed))]
@@ -105,8 +166,8 @@ class BoatController:
         y_obs = [depths_passed[i] * np.sin(angles_passed[i] * np.pi / 180) for i in range(len(angles_passed)) if depths_passed[i] <= max_supported_dist]
         #print(f"X obs, Y obs: {x_obs}, {y_obs}")
         print(f"Min depth: {min([np.sqrt(x_obs[i]**2 + y_obs[i]**2) for i in range(len(x_obs))])}")
-        self.drawn.set_xdata(x_obs)
-        self.drawn.set_ydata(y_obs)
+        self.drawn.set_xdata(y_obs)
+        self.drawn.set_ydata(x_obs)
         self.fig.canvas.draw()
         self.fig.canvas.flush_events()
         

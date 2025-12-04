@@ -110,6 +110,9 @@ class VideoProcessing {
             }
             std::cout << "Calibration file found. Loading..." << std::endl;
 
+            // Use our own calibration file instead
+            calibration_file = "/usr/local/zed/settings/SN33750276.conf";
+
             // ----> Frame size
             cap.getFrameSize(w,h);
             // <---- Frame size
@@ -156,7 +159,7 @@ class VideoProcessing {
             std::cout << "Done with constructor" << std::endl;
         }
         
-        py::tuple grab_depth() {
+        py::tuple grab_depth(int row_step, int col_step, int process_depth_flags, int patch_size, double sigma_bilateral) {
             std::cout << "Starting grab depth" << std::endl;
             // Get a new frame from camera
             const sl_oc::video::Frame frame = cap.getLastFrame();
@@ -236,6 +239,29 @@ class VideoProcessing {
             sl_oc::tools::showImage("Disparity", left_disp_image, params.res,true, stereoElabInfo.str());
             // <---- Show disparity image
 
+            // Blurring / processing step
+            if (process_depth_flags & 1) {
+                // 1 indicates we should do a median blur
+                cv::Mat mask = (left_disp_float == left_disp_float) & (left_disp_float < std::numeric_limits<float>::infinity());
+                left_disp_float.setTo(10001,mask);
+                cv::medianBlur(left_disp_float,left_disp_float,patch_size);
+            }
+
+            if (process_depth_flags & 2) {
+                // 2 indicates we should do a Gaussian blur
+                cv::GaussianBlur(left_disp_float,left_disp_float,cv::Size(patch_size,patch_size),0.0,0.0);
+            }
+
+            if (process_depth_flags & 4) {
+                // 4 indicates we should do a bilateral filter
+                cv::Mat copy;
+                cv::Mat mask = (left_disp_float == 0.0);
+                left_disp_float.convertTo(copy, CV_32F);
+                copy.setTo(10000,mask); // Very high sentinel value gets ~0 weight in filter
+                cv::bilateralFilter(copy,left_disp_float,patch_size,sigma_bilateral,sigma_bilateral);
+                left_disp_float.setTo(0,mask);
+            }
+
             // ----> Extract Depth map
             // The DISPARITY MAP can be now transformed in DEPTH MAP using the formula
             // depth = (f * B) / disparity
@@ -244,7 +270,7 @@ class VideoProcessing {
             //std::cout << "Baseline: " << baseline << "\nfx: " << fx << std::endl;
             double num = static_cast<double>(fx*baseline);
             cv::divide(num,left_disp_float,left_depth_map);
-            //std::cout << "Num: " << num << "\nLeft depth map: " << left_disp_float << std::endl;
+            //std::cout << "\nLeft disp map: " << left_disp_float << "\nnum" << num << std::endl;
 
             float central_depth = left_depth_map.at<float>(left_depth_map.rows/2, left_depth_map.cols/2 );
             std::cout << "Depth of the central pixel: " << central_depth << " mm" << std::endl;
@@ -255,12 +281,14 @@ class VideoProcessing {
             size_t buf_size = static_cast<size_t>(left_depth_map.cols * left_depth_map.rows);
             std::vector<cv::Vec3d> buffer( buf_size, cv::Vec3f::all( std::numeric_limits<float>::quiet_NaN() ) );
             cv::Mat depth_map_cpu = left_depth_map;
+
             float* depth_vec = (float*)(&(depth_map_cpu.data[0]));
             std::cout << "Depth vec, index 0: " << *depth_vec << std::endl;
 
             py::array points(py::dtype::of<double>(), {left_depth_map.rows, left_depth_map.cols, 3});
             auto pts = points.mutable_unchecked<double, 3>();
             const double nan = std::numeric_limits<double>::quiet_NaN();
+            
 #pragma omp parallel for
             // Initialize return array to nan
             for (int r = 0; r < left_depth_map.rows; ++r) {
@@ -276,6 +304,9 @@ class VideoProcessing {
             {
                 size_t r = idx/left_depth_map.cols;
                 size_t c = idx%left_depth_map.cols;
+                if (r % row_step != 0 || c % col_step != 0) {
+                    continue;
+                }
                 double depth = static_cast<double>(depth_vec[idx]);
                 //std::cout << depth << " ";
                 if(!isinf(depth) && depth >=0 && depth > stereoPar.minDepth_mm && depth < stereoPar.maxDepth_mm)

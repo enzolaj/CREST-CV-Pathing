@@ -39,7 +39,7 @@ class BoatController:
         """ 
         Pass obstacle distances as if we had a lidar 
         """
-        print("Starting pass distances")
+        # print("Starting pass distances")
 
         # We have to convert discrete points defining obstacle bbox corners to 
         # continuous obstacle present/not present vals at each given angle
@@ -49,7 +49,7 @@ class BoatController:
 
         # depends on support for extensions to message 330
 
-        print("About to grab depth")
+        # print("About to grab depth")
                 
         fov_deg = 110
         num_pts = 72
@@ -60,11 +60,17 @@ class BoatController:
         max_supported_dist = 10000 # in mm
 
         spoof_depth_option = 0
-        row_step = 4                # Row step (Increment to pixels along rows when sampling)
-        col_step = 5                # Col step (Increment to pixels along cols when sampling)
+        row_step = 1                # Row step (Increment to pixels along rows when sampling)
+        col_step = 1                # Col step (Increment to pixels along cols when sampling)
         processing_flags = 4        # Processing flags
         patch_size = 7              # Patch size for bilateral filter
         sigma = 500.0               # Sigma for bilateral filter
+
+        target_quantile = 0.01      # Quantile of depth to use per measurement
+
+        # Theoretically we can mask out values vertically far from the camera
+        y_floor = -750 # mm above the camera
+        y_ceil = 750 # mm below the camera
         
         t0 = time.perf_counter()
         if spoof_depth_option == 1:
@@ -84,16 +90,22 @@ class BoatController:
                 patch_size,              
                 sigma           
             )
+        
+        if ret != 0:
+            return
+        
         t1 = time.perf_counter()
         print(f"Time to grab depth: {t1 - t0}")
-        print(f"Original shape: {pts.shape}")
+        # print(f"Original shape: {pts.shape}")
+
+        t_heatmap = time.perf_counter()
         mask = ~np.isnan(pts).any(axis=2)
 
         pts_zeroed = pts.copy()
         pts_zeroed[~mask] = 8000.0 # set Nan values to 8m
         pts_zeroed = pts_zeroed[:,:,2] # get only the Z (depth)
-        print(f"Shape of pts zeroed: {pts_zeroed.shape}")
-        print(f"pts zeroed: {pts_zeroed}")
+        # print(f"Shape of pts zeroed: {pts_zeroed.shape}")
+        # print(f"pts zeroed: {pts_zeroed}")
 
         grid_indices = np.indices((num_rows,num_cols))
         r = np.array(range(num_rows))
@@ -103,26 +115,31 @@ class BoatController:
         col_cond = (grid_indices[1] % col_step == 0)
         cond = row_cond & col_cond
         pts_zeroed = pts_zeroed[cond].reshape(num_rows // row_step,num_cols // col_step)
-        print(f"Resized points zeroed shape: {pts_zeroed.shape}")
+        # print(f"Resized points zeroed shape: {pts_zeroed.shape}")
 
         self.heatmap.set_data(pts_zeroed)
         #self.heatmap.set_clim(pts_zeroed.min(), pts_zeroed.max())
         self.heatmap.set_clim(min_supported_dist,5000)
+        print(f"Time to update heatmap: {time.perf_counter() - t_heatmap}")
 
         pts = pts[mask]
-        print(f"Grabbed depth: ret: {ret}, pts: {pts}")
-        print(f"Final shape: {pts.shape}")
-        print(f"Min raw dist: {min(np.linalg.norm(pts,axis=1))}")
-        print(f"Max x dist: {max(pts[:,0])}")
-        print(f"Max y dist: {max(pts[:,1])}")
-        print(f"Max z dist: {max(pts[:,2])}")
+        # print(f"Grabbed depth: ret: {ret}, pts: {pts}")
+        # print(f"Final shape: {pts.shape}")
+        # print(f"Min raw dist: {min(np.linalg.norm(pts,axis=1))}")
+        # print(f"Max x dist: {max(pts[:,0])}")
+        # print(f"Max y dist: {max(pts[:,1])}")
+        # print(f"Max z dist: {max(pts[:,2])}")
 
-        if ret != 0:
-            return
+        # Mask out too far y values
+        y_valid_mask = (pts[:,1] < y_ceil) & (pts[:,1] > y_floor)
+        pts = pts[y_valid_mask]
+        print(f"Masked out {sum(~y_valid_mask)} pts outside the Y range, out of {len(y_valid_mask)} pts")
         
+        t_yaw = time.perf_counter()
         yaws = np.atan2(pts[:,0],pts[:,2]) * 180 / np.pi
-        print(f"Yaws shape: {yaws.shape}")
-        print(f"Yaw min and max: {max(yaws)}, {min(yaws)}")
+        print(f"Time to compute yaws: {time.perf_counter() - t_yaw}")
+        # print(f"Yaws shape: {yaws.shape}")
+        # print(f"Yaw min and max: {max(yaws)}, {min(yaws)}")
 
         angle_offset = float(fov_deg/2) # CW from forward
         increment_f = -1*fov_deg/num_pts
@@ -133,10 +150,10 @@ class BoatController:
         depths_passed = [max_supported_dist+1]*72
         angles_passed = [angle_offset + increment_f*i for i in range(72)]
 
-        t0 = time.perf_counter()
+        t0_angles = time.perf_counter()
         bin_indices = np.floor((angle_offset - yaws) / bin_width).astype(int)
         bin_indices = np.clip(bin_indices, 0, num_pts-1)
-        print(f"Max, mean, min bin indices {np.max(bin_indices)}, {np.mean(bin_indices)}, {np.min(bin_indices)}")
+        # print(f"Max, mean, min bin indices {np.max(bin_indices)}, {np.mean(bin_indices)}, {np.min(bin_indices)}")
 
         target_quantiles = [[] for i in range(72)]
         depth = np.hypot(pts[:,0], pts[:,2])
@@ -150,26 +167,27 @@ class BoatController:
         target_quantiles = [np.array([max_supported_dist+1]) if len(list_) == 0 else np.array(list_) for list_ in target_quantiles]
         depths_passed = np.full(num_pts, max_supported_dist+1, dtype=float)
         for i in range(len(depths_passed)):
-            depths_passed[i] = np.quantile(target_quantiles[i],0.01)
-        print(f"Time to do quantiles: {time.perf_counter() - tq}")
+            depths_passed[i] = np.quantile(target_quantiles[i],target_quantile)
+        #print(f"Time to do quantiles: {time.perf_counter() - tq}")
 
-        print(f"Time to get angles closest: {time.perf_counter() - t0}")
+        print(f"Time to get angles closest: {time.perf_counter() - t0_angles}")
         #print(f"depth shape {depth.shape}")
 
         #print(f"Angles passed: {angles_passed}")
-        print(f"Depths passed has shape {depths_passed.shape} and values: {depths_passed}")
+        #print(f"Depths passed has shape {depths_passed.shape} and values: {depths_passed}")
         
         # Plotting code --- just for visualization
-        # x_obs = [depths_passed[i] * np.cos(angles_passed[i] * np.pi / 180) for i in range(len(angles_passed))]
-        # y_obs = [depths_passed[i] * np.sin(angles_passed[i] * np.pi / 180) for i in range(len(angles_passed))]
         x_obs = [depths_passed[i] * np.cos(angles_passed[i] * np.pi / 180) for i in range(len(angles_passed)) if depths_passed[i] <= max_supported_dist]
         y_obs = [depths_passed[i] * np.sin(angles_passed[i] * np.pi / 180) for i in range(len(angles_passed)) if depths_passed[i] <= max_supported_dist]
         #print(f"X obs, Y obs: {x_obs}, {y_obs}")
-        print(f"Min depth: {min([np.sqrt(x_obs[i]**2 + y_obs[i]**2) for i in range(len(x_obs))])}")
+        #print(f"Min depth: {min([np.sqrt(x_obs[i]**2 + y_obs[i]**2) for i in range(len(x_obs))])}")
+        
+        ttt = time.perf_counter()
         self.drawn.set_xdata(y_obs)
         self.drawn.set_ydata(x_obs)
         self.fig.canvas.draw()
         self.fig.canvas.flush_events()
+        print(f"Drawing took {time.perf_counter() - ttt}")
         
         if self.connection is not None:
             self.connection.mav.obstacle_distance_send( 
@@ -183,6 +201,7 @@ class BoatController:
                 angle_offset,
                 frame
             )
+        print(f"\n\nIteration time: {time.perf_counter() - t0}\n")
 
     def arm(self):
         """

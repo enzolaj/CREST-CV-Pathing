@@ -42,3 +42,9 @@ target_compile_definitions(depth_blur PRIVATE
 )
 
 remove_definitions(-DSENSORS_MOD_AVAILABLE)
+
+file(COPY ${CMAKE_SOURCE_DIR}/data/camera_calibration.conf
+     DESTINATION ${CMAKE_BINARY_DIR}/data)
+
+target_compile_definitions(depth_wrapper
+    PRIVATE CALIB_FILE="${CMAKE_BINARY_DIR}/data/camera_calibration.conf")

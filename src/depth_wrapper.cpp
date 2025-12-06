@@ -111,7 +111,7 @@ class VideoProcessing {
             std::cout << "Calibration file found. Loading..." << std::endl;
 
             // Use our own calibration file instead
-            calibration_file = "/usr/local/zed/settings/SN33750276.conf";
+            calibration_file = CALIB_FILE;
 
             // ----> Frame size
             cap.getFrameSize(w,h);

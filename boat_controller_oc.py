@@ -93,7 +93,7 @@ class BoatController:
         
         if ret != 0:
             return
-        
+        print([pt for pt in pts])
         t1 = time.perf_counter()
         print(f"Time to grab depth: {t1 - t0}")
         # print(f"Original shape: {pts.shape}")

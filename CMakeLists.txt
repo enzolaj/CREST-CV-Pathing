@@ -11,7 +11,6 @@ find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
 
 add_subdirectory(zed-open-capture)
 pybind11_add_module(depth_wrapper src/depth_wrapper.cpp)
-add_executable(depth_blur src/zed_oc_depth_blur.cpp)
 
 target_link_libraries(depth_wrapper
     PRIVATE zed_open_capture ${OpenCV_LIBS}
@@ -27,6 +26,16 @@ target_compile_definitions(depth_wrapper PRIVATE
     VIDEO_MOD_AVAILABLE
 )
 
+remove_definitions(-DSENSORS_MOD_AVAILABLE)
+
+file(COPY ${CMAKE_SOURCE_DIR}/data/camera_calibration.conf
+     DESTINATION ${CMAKE_BINARY_DIR}/data)
+
+target_compile_definitions(depth_wrapper
+    PRIVATE CALIB_FILE="${CMAKE_BINARY_DIR}/data/camera_calibration.conf")
+
+# Gaussian blur script, used in isolation
+add_executable(depth_blur src/zed_oc_depth_blur.cpp)
 target_link_libraries(depth_blur
     PRIVATE zed_open_capture ${OpenCV_LIBS}
 )
@@ -40,11 +49,3 @@ target_include_directories(depth_blur
 target_compile_definitions(depth_blur PRIVATE
     VIDEO_MOD_AVAILABLE
 )
-
-remove_definitions(-DSENSORS_MOD_AVAILABLE)
-
-file(COPY ${CMAKE_SOURCE_DIR}/data/camera_calibration.conf
-     DESTINATION ${CMAKE_BINARY_DIR}/data)
-
-target_compile_definitions(depth_wrapper
-    PRIVATE CALIB_FILE="${CMAKE_BINARY_DIR}/data/camera_calibration.conf")

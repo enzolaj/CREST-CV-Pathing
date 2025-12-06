@@ -280,16 +280,74 @@ class VideoProcessing {
             sl_oc::tools::StopWatch pc_clock;
             size_t buf_size = static_cast<size_t>(left_depth_map.cols * left_depth_map.rows);
             std::vector<cv::Vec3d> buffer( buf_size, cv::Vec3f::all( std::numeric_limits<float>::quiet_NaN() ) );
-            cv::Mat depth_map_cpu = left_depth_map;
 
-            float* depth_vec = (float*)(&(depth_map_cpu.data[0]));
+            cv::Mat depth_map_cpu;
+            if (left_depth_map.type() != CV_32FC1) {
+                // Convert depth to float if needed (e.g. from 16U)
+                left_depth_map.convertTo(depth_map_cpu, CV_32FC1);
+            } else if (!left_depth_map.isContinuous()) {
+                // Make sure data is tightly packed
+                depth_map_cpu = left_depth_map.clone();
+            } else {
+                depth_map_cpu = left_depth_map;
+            }
+
+            const int rows = depth_map_cpu.rows;
+            const int cols = depth_map_cpu.cols;
+            const float* depth_vec = depth_map_cpu.ptr<float>(0); // flat pointer, guaranteed OK now
             std::cout << "Depth vec, index 0: " << *depth_vec << std::endl;
+                        
+            /*
+            Previously done using OpemMP parallel for and mutable_unchecked for writing into Numpy
+            array, but this kept resulting in an array of 1 value repeated when run on the Latte Panda. 
+            Instead, we use a raw pointer and run through the 
+            */
 
+            py::array_t<double> points({rows, cols, 3});
+            py::buffer_info info = points.request();
+            double* data = static_cast<double*>(info.ptr);
+
+            const double nan = std::numeric_limits<double>::quiet_NaN();
+
+            // Initialize to nan
+            for (int r = 0; r < rows; ++r) {
+                for (int c = 0; c < cols; ++c) {
+                    size_t base = (static_cast<size_t>(r) * cols + c) * 3;
+                    data[base + 0] = nan;
+                    data[base + 1] = nan;
+                    data[base + 2] = nan;
+                }
+            }
+            // Fill from depth
+            for (int r = 0; r < rows; ++r) {
+                const float* depth_row = depth_map_cpu.ptr<float>(r);
+                for (int c = 0; c < cols; ++c) {
+                    if (row_step <= 0 || col_step <= 0) {
+                        // don't use negative steps
+                    } else if (r % row_step != 0 || c % col_step != 0) {
+                        continue;
+                    }
+
+                    double depth = static_cast<double>(depth_row[c]);
+
+                    if (!std::isinf(depth) && depth >= 0 &&
+                        depth > stereoPar.minDepth_mm && depth < stereoPar.maxDepth_mm)
+                    {
+                        size_t base = (static_cast<size_t>(r) * cols + c) * 3;
+                        data[base + 2] = depth;
+                        data[base + 0] = (c - cx) * depth / fx;
+                        data[base + 1] = (r - cy) * depth / fy;
+                    }
+                }
+            }
+            return py::make_tuple(0, points);
+
+            /*
             py::array points(py::dtype::of<double>(), {left_depth_map.rows, left_depth_map.cols, 3});
             auto pts = points.mutable_unchecked<double, 3>();
             const double nan = std::numeric_limits<double>::quiet_NaN();
             
-#pragma omp parallel for
+//#pragma omp parallel for
             // Initialize return array to nan
             for (int r = 0; r < left_depth_map.rows; ++r) {
                 for (int c = 0; c < left_depth_map.cols; ++c) {
@@ -298,7 +356,35 @@ class VideoProcessing {
                     pts(r, c, 2) = nan;
                 }
             }
+            std::cout << "minDepth_mm=" << stereoPar.minDepth_mm << " maxDepth_mm=" << stereoPar.maxDepth_mm << std::endl;
 
+//#pragma omp parallel for
+            for (int r = 0; r < rows; ++r) {
+                const float* depth_row = depth_map_cpu.ptr<float>(r);
+                for (int c = 0; c < cols; ++c) {
+                    size_t idx = static_cast<size_t>(r) * cols + c;
+
+                    if (r % row_step != 0 || c % col_step != 0)
+                        continue;
+
+                    double depth = static_cast<double>(depth_row[c]);
+                    if (!std::isinf(depth) && depth >= 0 &&
+                        depth > stereoPar.minDepth_mm && depth < stereoPar.maxDepth_mm)
+                    {
+                        pts(r,c,2) = depth;
+                        pts(r,c,0) = (c - cx) * depth / fx;
+                        pts(r,c,1) = (r - cy) * depth / fy;
+                    }
+                }
+            }
+
+            std::cout << "fx=" << fx << " fy=" << fy
+                    << " cx=" << cx << " cy=" << cy << std::endl;
+            std::cout << "Depth map type: " << left_depth_map.type()
+                    << " continuous: " << left_depth_map.isContinuous() << std::endl;
+
+            return py::make_tuple(0, points);
+/*
 #pragma omp parallel for
             for(size_t idx=0; idx<buf_size;idx++ )
             {
@@ -321,6 +407,7 @@ class VideoProcessing {
                 }
             }
             return py::make_tuple(0, points);
+*/
             /*
             py_array_t<double> pts({buf_size, 3});
             auto buf = pts.request();
